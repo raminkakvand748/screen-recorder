@@ -1,6 +1,6 @@
 ## Requirements
 
-#Windows#
+Windows
 opencv-python>=4.8
 mss>=9.0
 numpy>=1.24
