@@ -37,5 +37,3 @@ python -m nuitka --standalone --enable-plugin=tk-inter ^
   --include-data-files="C:\path\to\ffmpeg.exe=ffmpeg.exe" ^
   screen_recorder.py
 ```
-
-The resulting `screen_recorder.dist/` folder is the distributable — zip it and attach it to a GitHub **Release**.
