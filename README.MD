@@ -37,3 +37,7 @@ python -m nuitka --standalone --enable-plugin=tk-inter ^
   --include-data-files="C:\path\to\ffmpeg.exe=ffmpeg.exe" ^
   screen_recorder.py
 ```
+
+## AI Assistance
+
+This project is primarily human-written. AI coding assistants (Claude) were used for specific portions — including [refactoring / documentation / debugging / boilerplate], and every AI-assisted change was reviewed, tested, and integrated by the author.
