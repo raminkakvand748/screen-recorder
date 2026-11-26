@@ -46,13 +46,6 @@ python -m nuitka --standalone --enable-plugin=tk-inter ^
   screen_recorder.py
 ```
 
-## Third-Party Software
-This application bundles FFmpeg (https://ffmpeg.org), which is licensed under the GNU General Public License v3 (GPLv3).
-
-A copy of the GPLv3 license text is included in the licenses folder of this repository.
-
-The corresponding source code for the exact FFmpeg version used can be downloaded from [Insert Link to Source Code] or is available upon written request.
-
 ## AI Assistance
 
 This project is primarily human-written. AI coding assistants (Claude) were used for specific portions — including [refactoring / documentation / debugging / boilerplate], and every AI-assisted change was reviewed, tested, and integrated by the author.
