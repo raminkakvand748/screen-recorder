@@ -1,15 +1,23 @@
+## Features
+
+- **Full-screen capture** using `mss` (and a low-latency `dxcam` preview).
+- **Flexible audio recording**: Capture Microphone, System Audio via WASAPI (no Stereo Mix required), or mix both together seamlessly.
+- **Multi-monitor support**: Choose which display to record and preview from a dropdown menu.
+- **Pause / Resume** without breaking the output file or audio sync.
+- **Real-time preview** toggle (hidden automatically during recording).
+- **Quality presets**: 1080p, 720p, 480p.
+- **Eight output formats**: MP4 (H.264), MKV, MOV, AVI (MPEG-4), TS, FLV, WEBM (VP9), and WMV.
+- **Optional extra compression**: A one-click checkbox to re-encode the final file with a slower preset for maximum file size reduction.
+- **Crash-safe**: temporary files are cleaned up automatically; broken pipes and background thread errors are caught and shown via UI dialogs.
+
 ## Requirements
 
-Windows
-opencv-python>=4.8
-mss>=9.0
-numpy>=1.24
-sounddevice>=0.4.6
-wavio>=0.4.6
-colorama>=0.4.6
-dxcam>=0.0.5
-Pillow>=10.0
-**FFmpeg** on `PATH`, or `ffmpeg.exe` next to the script
+- **Windows 10/11**
+- **FFmpeg** on `PATH`, or `ffmpeg.exe` next to the script.
+
+Install the Python dependencies via pip:
+```bash
+pip install -r requirements.txt
 
 ## Installation & Usage
 
@@ -37,6 +45,8 @@ python -m nuitka --standalone --enable-plugin=tk-inter ^
   --include-data-files="C:\path\to\ffmpeg.exe=ffmpeg.exe" ^
   screen_recorder.py
 ```
+
+The resulting `screen_recorder.dist/` folder is the distributable — zip it and attach it to a GitHub **Release**.
 
 ## AI Assistance
 
