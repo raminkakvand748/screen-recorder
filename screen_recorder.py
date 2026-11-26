@@ -571,7 +571,7 @@ def session():
 
         cmd = build_record_cmd(ffmpeg_path, video_temp)
         # bufsize=0 -> unbuffered stdin, so capture back-pressure is real
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=0)
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=0, creationflags=subprocess.CREATE_NO_WINDOW)
 
         start_time = time.perf_counter()
         capture_thread = threading.Thread(target=capture)
@@ -632,7 +632,7 @@ def session():
                 except OSError:
                     in_mb = None
                 ui_post(lambda: window.title("Screen Recorder — Compressing..."))
-                subprocess.run(compress_cmd, check=True)
+                subprocess.run(compress_cmd, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
                 ui_post(lambda: window.title("Screen Recorder"))
                 try:
                     out_mb = os.path.getsize(out_path) / (1024 * 1024)
@@ -666,7 +666,7 @@ def session():
                     "-shortest",
                     out_path,
                 ]
-                subprocess.run(merge_cmd, check=True)
+                subprocess.run(merge_cmd, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
             else:
                 shutil.copy(video_temp, out_path)
         except Exception as e:
