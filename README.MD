@@ -49,3 +49,6 @@ python -m nuitka --standalone --enable-plugin=tk-inter ^
 ## AI Assistance
 
 This project is primarily human-written. AI coding assistants (Claude) were used for specific portions — including [refactoring / documentation / debugging / boilerplate], and every AI-assisted change was reviewed, tested, and integrated by the author.
+
+## Third-Party Software
+This application bundles FFmpeg. For licensing information, please see [LICENSES.md](LICENSES.md).
