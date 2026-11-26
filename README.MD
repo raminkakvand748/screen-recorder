@@ -46,7 +46,6 @@ python -m nuitka --standalone --enable-plugin=tk-inter ^
   screen_recorder.py
 ```
 
-The resulting `screen_recorder.dist/` folder is the distributable — zip it and attach it to a GitHub **Release**.
 
 ## AI Assistance
 
