@@ -2,6 +2,7 @@ opencv-python>=4.8
 mss>=9.0
 numpy>=1.24
 sounddevice>=0.4.6
+soundcard>=0.4.2
 wavio>=0.4.6
 colorama>=0.4.6
 dxcam>=0.0.5
