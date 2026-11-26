@@ -40,10 +40,7 @@ Enter a filename, pick **format** and **quality**, press **‚óè** to record, **‚ñ
 
 ```bash
 pip install nuitka
-python -m nuitka --standalone --enable-plugin=tk-inter ^
-  --windows-console-mode=disable ^
-  --include-data-files="C:\path\to\ffmpeg.exe=ffmpeg.exe" ^
-  screen_recorder.py
+python -m nuitka --standalone --enable-plugin=tk-inter --windows-console-mode=disable --include-package=comtypes --include-package=soundcard --include-package=dxcam --include-package=sounddevice --include-package=cffi --include-module=_cffi_backend --include-package-data=soundcard --include-data-files="C:\path\to\ffmpeg.exe=ffmpeg.exe" screen_recorder.py
 ```
 
 ## AI Assistance
