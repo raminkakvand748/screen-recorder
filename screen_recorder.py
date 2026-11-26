@@ -1,3 +1,45 @@
+"""
+Screen Recorder
+===============
+A desktop screen recorder for Windows with multi-monitor capture, selectable
+audio sources, a live preview, and optional post-recording compression.
+
+Architecture overview
+---------------------
+The application is split across several threads coordinated with
+`threading.Event` flags:
+
+    main thread (Tk)  – runs the GUI and dispatches queued UI callbacks
+    session thread    – owns one recording lifecycle (start → stop → save)
+    capture thread    – grabs screen frames with `mss` and timestamps them
+    encode thread     – converts timestamped frames into a constant 30 FPS
+                         stream and pipes raw BGR data into FFmpeg
+    audio thread      – records microphone audio with `sounddevice` and/or
+                         system audio through WASAPI loopback (`soundcard`)
+    preview thread    – reads the selected monitor through a cached DXGI
+                         camera (`dxcam`) and updates the preview frame
+
+Frame and audio flow:
+    capture → (frame, active timestamp) queue → encode → FFmpeg → temp video
+    microphone ───────────────────────────────────────────────→ temp WAV
+    WASAPI loopback ──────────────────────────────────────────→ temp WAV
+    stop → mux audio/video, or optionally re-encode for extra compression
+
+Synchronization:
+    Rawvideo sent through FFmpeg's stdin has no per-frame timestamps. The
+    capture thread therefore attaches elapsed active-recording time to each
+    frame. The encoder uses those timestamps to place frames on a constant
+    30 FPS timeline, repeating the previous image when capture runs below
+    the output rate. Paused time is excluded from the timestamps and final
+    video duration, preventing capture-rate variation from accumulating as
+    audio/video drift.
+
+Thread safety:
+    Tkinter is not thread-safe. Worker threads send UI work through
+    `ui_post()`, and the main thread executes queued callbacks. Shared audio
+    buffers, preview frames, and preview-camera access use locks.
+"""
+
 import sys, traceback
 sys.excepthook = lambda t, v, tb: (traceback.print_exception(t, v, tb), input("crash — Enter to close"))
 
@@ -41,15 +83,19 @@ colorama.just_fix_windows_console()
 RED = "\033[31m"
 RESET = "\033[0m"
 
-# ---- video settings ----
+# --------------------------------------------------------------------------
+# Video settings
+# --------------------------------------------------------------------------
 capture_width, capture_height = 1920, 1080 #fallback, overridden in session()
 output_width,  output_height  = 1920, 1080
-fps = 30.5
-fps_output = 30
+fps = 30.00
+fps_output = 30.00
 monitor = {"top": 0, "left": 0, "width": capture_width, "height": capture_height}
 format = ""          # ".mp4" or ".avi", set by UI
 
-# ---- audio settings ----
+# --------------------------------------------------------------------------
+# Audio settings
+# --------------------------------------------------------------------------
 SAMPLE_RATE = 44100
 CHANNELS    = 2
 DTYPE       = "int16"
@@ -62,9 +108,15 @@ selected_mic_idx     = None      # device index for the mic (None = default)
 selected_loopback_idx = None     # device index for system-audio loopback (None = unavailable)
 audio_mode           = "mic"     # "mic" | "system" | "mic+system"
 
-# ---- shared state ----
+# --------------------------------------------------------------------------
+# Shared state between threads
+# --------------------------------------------------------------------------
 filename        = ""
-Frames          = queue.Queue(maxsize=4)
+# The bounded queue limits memory use; each item carries its active-time timestamp.
+Frames          = queue.Queue(maxsize=4)  # items are (frame, active_time_seconds)
+# The encoder drains queued frames until capture has finished.
+capture_finished = threading.Event()
+capture_duration = 0.0
 stop_event      = threading.Event()
 pause_event = threading.Event()
 pause_accum = 0.0
@@ -72,16 +124,20 @@ pause_mark = None
 pause_lock = threading.Lock()
 audio_started = threading.Event()
 capture_ready = threading.Event()
+system_ready = threading.Event()
 session_thread  = None
 recording       = False
 recording_finishing = False     
 preview_was_on      = False 
 save_requested  = False
 dropped_frames  = 0
+captured_frames = 0
 encoded_frames  = 0
 compress_final = False
 
-# ---- preview setting ----
+# --------------------------------------------------------------------------
+# Multi-monitor preview (DXGI-based, independent of recording capture)
+# --------------------------------------------------------------------------
 import dxcam
 from PIL import Image, ImageTk
 
@@ -94,6 +150,7 @@ preview_cameras      = {}             # dict: dxcam output_idx -> camera (one pe
 preview_camera_lock  = threading.Lock()
 _preview_switching   = threading.Event()
 
+# mss monitor indices are 1-based; dxcam output indices are 0-based.
 selected_monitor_idx = 1              # 1-based, matches mss.monitors indexing
 
 PREVIEW_W, PREVIEW_H = 740, 360
@@ -102,6 +159,11 @@ WINDOW_H_BASE        = 220
 WINDOW_H_PREVIEW     = WINDOW_H_BASE + PREVIEW_H + 20
 
 def preview_loop():
+    """Continuously read the selected monitor and publish a downscaled frame.
+
+    The DXGI camera is cached per monitor. This worker only updates the shared
+    preview image; Tk image creation and widget updates happen on the UI thread.
+    """
     global preview_frame
 
     # mss uses 1-based indices; dxcam uses 0-based
@@ -134,6 +196,11 @@ def preview_loop():
             pass
 
 def toggle_preview():
+    """Start or stop the preview and adjust the window height.
+
+    Preview is disabled during recording because the preview window could
+    otherwise be included in the screen capture.
+    """
     global preview_thread, preview_frame
 
     # Called internally by start_record() (before recording=True) to hide
@@ -214,79 +281,162 @@ def _get_preview_camera(output_idx):
         return preview_cameras[output_idx]
    
 
-# ---- temp dir cleanup ----
+# --------------------------------------------------------------------------
+# Temporary directory management
+# --------------------------------------------------------------------------
 _tempdirs = []
 def _cleanup_temps():
+    """Remove temporary recording directories left behind at process exit."""
     for d in _tempdirs:
         shutil.rmtree(d, ignore_errors=True)
 atexit.register(_cleanup_temps)
 
-# ---- capture thread ----
+# --------------------------------------------------------------------------
+# Timestamped screen-capture thread
+# --------------------------------------------------------------------------
 def capture():
-    global dropped_frames
+    """Capture frames and attach their real active-recording timestamps.
+
+    Timestamps exclude paused time. The encoder uses them to duplicate frames
+    onto the 30 FPS output timeline when capture temporarily runs below 30 FPS.
+    """
+    global dropped_frames, captured_frames, capture_duration
+
     frame_interval = 1 / fps
     need_resize = (output_width, output_height) != (capture_width, capture_height)
-    with mss.MSS() as screen:
-        next_frame_time = time.perf_counter()
-        capture_ready.set()
-        while not stop_event.is_set():
-            if pause_event.is_set():
-                next_frame_time = time.perf_counter()
-                time.sleep(0.02)
-                continue
-            screenshot = screen.grab(monitor)
-            frame = cv2.cvtColor(np.asarray(screenshot), cv2.COLOR_BGRA2BGR)
-            if need_resize:
-                frame = cv2.resize(frame, (output_width, output_height),
-                                   interpolation=cv2.INTER_LINEAR)
-            try:
-                Frames.put_nowait(frame)
-            except queue.Full:
-                dropped_frames += 1
+    active_elapsed = 0.0
+    last_tick = time.perf_counter()
+    last_frame_time = 0.0
 
-            next_frame_time += frame_interval
-            sleep_time = next_frame_time - time.perf_counter()
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            elif sleep_time < -frame_interval:
-                # fell behind -> reset schedule instead of burst-catchup
-                next_frame_time = time.perf_counter()
-
-# ---- encoder thread: pipe raw frames to ffmpeg ----
-def encode(proc):
-    global encoded_frames
-    while not stop_event.is_set() or not Frames.empty():
-        try:
-            frame = Frames.get(timeout=0.1)
-        except queue.Empty:
-            continue
-        try:
-            proc.stdin.write(frame.tobytes())
-            encoded_frames += 1
-        except (BrokenPipeError, OSError) as e:
-            print(RED + "ffmpeg pipe broke; stopping" + RESET)
-            stop_event.set()
-            ui_post(lambda err=e: messagebox.showerror(
-                "Recording failed",
-                f"Encoder stopped unexpectedly:\n{err}\n\n"
-                f"The current recording was not saved."))
-            break
     try:
-        proc.stdin.close()
-    except Exception:
-        pass
+        with mss.MSS() as screen:
+            next_frame_time = time.perf_counter()
+            while not stop_event.is_set():
+                now = time.perf_counter()
+                if pause_event.is_set():
+                    last_tick = now
+                    next_frame_time = now
+                    time.sleep(0.02)
+                    continue
 
-# ---- audio thread ----
+                active_elapsed += now - last_tick
+                last_tick = now
+
+                screenshot = screen.grab(monitor)
+                frame = cv2.cvtColor(np.asarray(screenshot), cv2.COLOR_BGRA2BGR)
+                if need_resize:
+                    frame = cv2.resize(frame, (output_width, output_height),
+                                       interpolation=cv2.INTER_LINEAR)
+
+                # Include the time spent acquiring/converting this frame.
+                frame_time = active_elapsed + (time.perf_counter() - now)
+                try:
+                    Frames.put_nowait((frame, frame_time))
+                except queue.Full:
+                    dropped_frames += 1
+                else:
+                    captured_frames += 1
+                    last_frame_time = frame_time
+                    capture_ready.set()
+
+                next_frame_time += frame_interval
+                sleep_time = next_frame_time - time.perf_counter()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                elif sleep_time < -frame_interval:
+                    # fell behind -> reset schedule instead of burst-catchup
+                    next_frame_time = time.perf_counter()
+    finally:
+        # Include the final active interval, but never count time spent paused.
+        if not pause_event.is_set():
+            capture_duration = max(last_frame_time,
+                                   active_elapsed + (time.perf_counter() - last_tick))
+        else:
+            capture_duration = last_frame_time
+        capture_finished.set()
+
+
+# --------------------------------------------------------------------------
+# Constant-frame-rate encoder thread
+# --------------------------------------------------------------------------
+def encode(proc):
+    """Write a 30 FPS timeline, repeating the previous frame when necessary.
+
+    Rawvideo input has no per-frame timestamp channel. Repeating frames at the
+    correct output slots preserves real elapsed time without requiring PyAV.
+    """
+    global encoded_frames
+    current_frame = None
+    next_output_time = 0.0
+    output_interval = 1.0 / fps_output
+
+    def write_frame(frame):
+        global encoded_frames
+        proc.stdin.write(frame.tobytes())
+        encoded_frames += 1
+
+    try:
+        while not capture_finished.is_set() or not Frames.empty():
+            try:
+                frame, frame_time = Frames.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if current_frame is None:
+                current_frame = frame
+                write_frame(current_frame)  # first output frame at t=0
+                next_output_time = output_interval
+                continue
+
+            # Fill every output timestamp before this newly captured frame
+            # with the previous image. The new image becomes current afterward.
+            while next_output_time < frame_time:
+                write_frame(current_frame)
+                next_output_time += output_interval
+            current_frame = frame
+
+        # Extend the final image to the end of the active recording interval.
+        if current_frame is not None:
+            while next_output_time < capture_duration:
+                write_frame(current_frame)
+                next_output_time += output_interval
+
+    except (BrokenPipeError, OSError) as e:
+        print(RED + "ffmpeg pipe broke; stopping" + RESET)
+        stop_event.set()
+        ui_post(lambda err=e: messagebox.showerror(
+            "Recording failed",
+            f"Encoder stopped unexpectedly:\\n{err}\\n\\n"
+            f"The current recording was not saved."))
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+
+# --------------------------------------------------------------------------
+# Microphone and system-audio workers
+# --------------------------------------------------------------------------
 def _audio_callback(indata, frame_count, time_info, status, target):
-    audio_started.set()
+    """Append a microphone chunk when capture is active and not paused.
+
+    The callback is invoked by PortAudio. It copies each accepted chunk so
+    the audio backend can safely reuse its input buffer.
+    """
     if status:
         print(status)
-    if not capture_ready.is_set() or pause_event.is_set():
+    if stop_event.is_set() or not capture_ready.is_set() or pause_event.is_set():
         return
     with audio_lock:
         target.append(indata.copy())
 
 def enumerate_audio_devices():
+    """Build the audio-source dropdown entries from available input devices.
+
+    The first usable microphone is selected by default. System audio is
+    offered separately through WASAPI loopback, with a combined option when
+    both microphone and system audio are wanted.
+    """
     global audio_source_devices, selected_mic_idx
 
     try:
@@ -315,40 +465,49 @@ def enumerate_audio_devices():
         audio_source_devices.append((f"Mic: {devices[i]['name'][:40]}", i))
 
 def _record_system_audio_thread():
-    """Continuously record system audio using WASAPI loopback."""
-    # Initialize COM for this thread
+    """Record system audio, synchronized with video capture."""
+
     ctypes.windll.ole32.CoInitialize(None)
-    
+
     try:
-        # Get the default speaker
         speaker = sc.default_speaker()
-        
-        # Fetch the loopback microphone for this speaker
-        loopback_mic = sc.get_microphone(id=str(speaker.name), include_loopback=True)
-        
+
+        loopback_mic = sc.get_microphone(
+            id=str(speaker.name),
+            include_loopback=True
+        )
+
         if not loopback_mic:
-            print(RED + "Could not find loopback microphone for default speaker." + RESET)
+            print(RED + "Could not find loopback microphone." + RESET)
             return
 
-        # Record from the loopback microphone
-        with loopback_mic.recorder(samplerate=SAMPLE_RATE, channels=CHANNELS) as recorder:
+        with loopback_mic.recorder(
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS
+        ) as recorder:
+
+            # Tell the main audio thread WASAPI is ready.
+            system_ready.set()
+
+            # Discard audio captured before video starts.
+            while not capture_ready.is_set() and not stop_event.is_set():
+                recorder.record(numframes=1024)
+
             while not stop_event.is_set():
-                # Record 1024 frames
                 data = recorder.record(numframes=1024)
-                
+
                 if pause_event.is_set():
                     continue
 
-                # soundcard returns float32 (from -1.0 to 1.0), convert to int16
                 chunk_int16 = (data * 32767).astype(np.int16)
-                
+
                 with audio_lock:
                     loop_frames.append(chunk_int16)
-                    
+
     except Exception as e:
         print(RED + f"WASAPI Loopback failed: {e}" + RESET)
+
     finally:
-        # Clean up COM
         ctypes.windll.ole32.CoUninitialize()
 
 def record_audio(path):
@@ -379,7 +538,13 @@ def record_audio(path):
     # 3. Start Recording
     for s in streams:
         s.start()
-    
+
+    # Wait until WASAPI is actually initialized.
+    if system_thread is not None:
+        if not system_ready.wait(timeout=5.0):
+            print(RED + "WASAPI initialization timed out." + RESET)
+
+    # All audio sources are now ready.
     audio_started.set() # Signal that audio is running
 
     try:
@@ -391,6 +556,10 @@ def record_audio(path):
             except: pass
             try: s.close()
             except: pass
+
+        # Wait for system audio to finish.
+    if system_thread is not None:
+        system_thread.join()
             
         # The system_thread will exit automatically because stop_event is set
         
@@ -455,6 +624,11 @@ def detect_monitor():
     return dict(mon)
 
 def build_record_cmd(ffmpeg_path, out_path):
+    """Build FFmpeg's raw-BGR input and selected output codec command.
+
+    Frame timestamps are converted to the constant output rate by `encode()`
+    before frame bytes reach FFmpeg.
+    """
     if format == ".mp4":
         vcodec = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
                   "-pix_fmt", "yuv420p"]
@@ -535,9 +709,19 @@ def build_compress_cmd(ffmpeg_path, in_video, in_audio, out_path, has_audio):
     cmd.append(out_path)
     return cmd
 
-# ---- main function ----
+# --------------------------------------------------------------------------
+# Session (one complete recording lifecycle)
+# --------------------------------------------------------------------------
 def session():
-    global filename, save_requested, dropped_frames, encoded_frames
+    """Run one complete recording lifecycle on the session worker thread.
+
+    Selects the monitor, resets session state, launches FFmpeg and the capture,
+    encode, and audio workers, then waits for them to finish. If saving was
+    requested, it muxes the temporary streams and optionally compresses the
+    result before restoring the UI.
+    """
+    global filename, save_requested, dropped_frames, captured_frames, encoded_frames
+    global capture_duration
     global monitor, capture_width, capture_height
     global recording
 
@@ -561,7 +745,10 @@ def session():
             except queue.Empty:
                 break
         dropped_frames = 0
+        captured_frames = 0
         encoded_frames = 0
+        capture_duration = 0.0
+        capture_finished.clear()
 
         try:
             ffmpeg_path = find_ffmpeg()
@@ -573,7 +760,6 @@ def session():
         # bufsize=0 -> unbuffered stdin, so capture back-pressure is real
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=0, creationflags=subprocess.CREATE_NO_WINDOW)
 
-        start_time = time.perf_counter()
         capture_thread = threading.Thread(target=capture)
         encode_thread  = threading.Thread(target=encode, args=(proc,))
         audio_thread   = threading.Thread(target=record_audio, args=(audio_temp,))
@@ -582,6 +768,8 @@ def session():
 
         if not audio_started.wait(timeout=3.0):
             print("no audio device! video only!")
+
+        start_time = time.perf_counter()
 
         capture_thread.start()
         encode_thread.start()
@@ -603,13 +791,15 @@ def session():
 
         active = elapsed - paused_total
         if active > 0:
-            print(RED + f"Average FPS: {encoded_frames / active:.2f} "
+            print(RED + f"Average capture FPS: {captured_frames / active:.2f} "
                     f"(drops: {dropped_frames}, paused {paused_total:.1f}s)" + RESET)
 
         if not save_requested:
+            ui_post(lambda: set_status("Discarded", "#aaaaaa"))
             shutil.rmtree(tmpdir, ignore_errors=True)
             return
 
+        ui_post(lambda: set_status("Saving...", "#e5b567"))
         print(RED + "Saved:" + RESET, video_temp)
 
         out_path = filename + format
@@ -631,9 +821,11 @@ def session():
                     in_mb = os.path.getsize(video_temp) / (1024 * 1024)
                 except OSError:
                     in_mb = None
-                ui_post(lambda: window.title("Screen Recorder — Compressing..."))
+                ui_post(lambda: (window.title("Screen Recorder — Compressing..."),
+                                 set_status("Compressing...", "#5dade2")))
                 subprocess.run(compress_cmd, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
-                ui_post(lambda: window.title("Screen Recorder"))
+                ui_post(lambda: (window.title("Screen Recorder"),
+                                 set_status("Saved", "#70c78a")))
                 try:
                     out_mb = os.path.getsize(out_path) / (1024 * 1024)
                     if in_mb is not None and in_mb > 0:
@@ -667,10 +859,13 @@ def session():
                     out_path,
                 ]
                 subprocess.run(merge_cmd, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                ui_post(lambda: set_status("Saved", "#70c78a"))
             else:
                 shutil.copy(video_temp, out_path)
+                ui_post(lambda: set_status("Saved", "#70c78a"))
         except Exception as e:
-            ui_post(lambda: window.title("Screen Recorder"))
+            ui_post(lambda: (window.title("Screen Recorder"),
+                             set_status("Save failed", "#ff7777")))
             print(RED + f"Save failed: {e}" + RESET)
             ui_post(lambda err=e: messagebox.showerror(
                 "Save failed", f"Could not write {out_path}:\n{err}"))
@@ -683,7 +878,9 @@ def session():
 
 enumerate_audio_devices()
 
-# ---- UI ----
+# --------------------------------------------------------------------------
+# Tkinter user interface
+# --------------------------------------------------------------------------
 import tkinter
 print("-> tkinter", flush=True)
 print("ALL IMPORTS OK", flush=True)
@@ -710,7 +907,13 @@ def ui_post(fn):
     _ui_queue.put(fn)
 
 
+def set_status(text, color="#aaaaaa"):
+    """Update the visible recording status (call on the Tk main thread)."""
+    status_label.config(text=text, fg=color)
+
+
 def _pump_ui_queue():
+    """Run pending UI callbacks and schedule the next queue-drain tick."""
     while True:
         try:
             fn = _ui_queue.get_nowait()
@@ -731,6 +934,7 @@ def _pump_ui_queue():
 # worker threads — an uncaught exception there would otherwise only hit
 # stderr (invisible if launched via pythonw).
 def _thread_crash(args):
+    """Report uncaught worker-thread exceptions in the console and GUI."""
     try:
         print(RED + f"{args.thread.name} crashed: {args.exc_value}" + RESET)
     except Exception:
@@ -773,6 +977,7 @@ entry = tkinter.Entry(row, width=40, bg=ENTRY_BG, fg=FG,
 entry.pack(side="left", padx=5)
 
 def start_record():
+    """Validate the selected options, reset state, and launch a session."""
     global session_thread, recording, filename, save_requested, pause_mark, pause_accum
     global preview_was_on, compress_final
 
@@ -800,6 +1005,7 @@ def start_record():
     pause_event.clear()
     audio_started.clear()
     capture_ready.clear()
+    system_ready.clear()
     pause_accum = 0.0
     pause_mark = None
     pause_btn.config(state="normal", text="⏸",font=("Arial", 14), fg="#ff5555",
@@ -812,10 +1018,12 @@ def start_record():
 
     compress_final = compress_var.get()
     recording = True
+    set_status("Recording", "#ff5555")
     session_thread = threading.Thread(target=session, daemon=True)
     session_thread.start()
 
 def stop_recording():
+    """Ask for the output path and signal the active session to stop."""
     global recording, filename, save_requested, recording_finishing
 
     if not recording or recording_finishing:
@@ -839,6 +1047,7 @@ def stop_recording():
 
     stop_event.set()
     pause_event.clear()
+    set_status("Finalizing...", "#e5b567")
     pause_btn.config(state="disabled", text="⏸", font=("Arial", 14), fg="#ff5555",
                bg=BUTTON_BG, activebackground="#505050", activeforeground=FG,
                relief="flat")
@@ -875,6 +1084,7 @@ def _poll_session_done():
     _ui_sync_after_session()
 
 def close_app():
+    """Stop active workers, release preview resources, and close the window."""
     global recording, recording_finishing
     stop_event.set()
     recording = False
@@ -891,6 +1101,7 @@ def close_app():
     window.destroy()
 
 def toggle_pause():
+    """Pause or resume capture and audio while excluding the pause interval."""
     global pause_mark, pause_accum
     if not recording:
         return
@@ -903,6 +1114,7 @@ def toggle_pause():
             pause_btn.config(text="⏸",font=("Arial", 14), fg="#ff5555",
                bg=BUTTON_BG, activebackground="#505050", activeforeground=FG,
                relief="flat")
+            set_status("Recording", "#ff5555")
             print("resumed")
         else:
             pause_mark = time.perf_counter()
@@ -910,6 +1122,7 @@ def toggle_pause():
             pause_btn.config(text="▶", font=("Arial", 14), fg="#ff5555",
                bg=BUTTON_BG, activebackground="#505050", activeforeground=FG,
                relief="flat")
+            set_status("Paused", "#e5b567")
             print("paused")
 
 
@@ -923,6 +1136,13 @@ make_tool_button(row, "■", "#ff5555", stop_recording).pack(side="left", padx=5
 make_tool_button(row, "👁", "#ff5555", toggle_preview).pack(side="left", padx=5)
 
 make_tool_button(row, "x", "#ff5555", close_app).pack(side="left", padx=5)
+
+# Live status indicator — updated only from the Tk main thread.
+status_label = tkinter.Label(
+    row, text="Ready", font=("Arial", 10, "bold"),
+    bg=BG, fg="#aaaaaa", padx=10
+)
+status_label.pack(side="left", padx=(10, 0))
 
 
 input_frame = tkinter.Frame(window, bg=BG)
@@ -944,10 +1164,12 @@ format_var  = tkinter.StringVar(master=window, value="MP4")
 quality_var = tkinter.StringVar(master=window, value="1080p")
 
 def on_format_selected(value):
+    """Update the output container selected in the format dropdown."""
     global format
     format = FORMAT_MAP[value]
 
 def on_quality_selected(value):
+    """Update the encoded video dimensions for the selected quality."""
     global output_width, output_height
     output_width, output_height = QUALITY_MAP[value]
 
@@ -959,7 +1181,9 @@ tkinter.Label(input_frame, text="quality: ", bg=BG, fg=FG).pack(side=tkinter.LEF
 make_dropdown(input_frame, quality_var, list(QUALITY_MAP),
               on_quality_selected).pack(side=tkinter.LEFT)
 
-# ---- extra compression toggle ----
+# --------------------------------------------------------------------------
+# Optional post-recording compression
+# --------------------------------------------------------------------------
 compress_var = tkinter.BooleanVar(master=window, value=False)
 tkinter.Checkbutton(
     input_frame, text="Compress more (takes a while to compress!)",
@@ -971,8 +1195,11 @@ tkinter.Checkbutton(
 on_format_selected(format_var.get())
 on_quality_selected(quality_var.get())
 
-# ---- monitor selection ----
+# --------------------------------------------------------------------------
+# Monitor and audio-source selection
+# --------------------------------------------------------------------------
 def _list_monitors():
+    """Return connected physical monitors with their mss indices."""
     with mss.MSS() as sct:
         return [(i, m) for i, m in enumerate(sct.monitors) if i > 0]
 
@@ -987,6 +1214,7 @@ monitor_var = tkinter.StringVar(master=window,
                                 value=MONITOR_LABELS[0])
 
 def on_monitor_selected(value):
+    """Update the recording monitor and switch the preview if it is active."""
     global selected_monitor_idx
     try:
         n = int(value.split()[1])
@@ -1008,6 +1236,7 @@ AUDIO_LABELS = [label for label, _ in audio_source_devices] or ["Microphone (def
 audio_var = tkinter.StringVar(master=window, value=AUDIO_LABELS[0])
 
 def on_audio_source_selected(value):
+    """Apply the selected microphone, system-audio, or combined source."""
     global audio_mode, selected_mic_idx
     for label, key in audio_source_devices:
         if label == value:
@@ -1028,7 +1257,9 @@ tkinter.Label(monitor_frame, text="  audio: ", bg=BG, fg=FG).pack(side=tkinter.L
 make_dropdown(monitor_frame, audio_var, AUDIO_LABELS,
               on_audio_source_selected, width=24).pack(side=tkinter.LEFT)
 
-# ---- embedded preview widget ----
+# --------------------------------------------------------------------------
+# Embedded preview widget
+# --------------------------------------------------------------------------
 preview_container = tkinter.Frame(window, bg="#000000",
                                    width=PREVIEW_W, height=PREVIEW_H)
 preview_container.pack_propagate(False)   # lock to 640x360
@@ -1058,7 +1289,10 @@ def update_preview():
     window.after(30, update_preview)
 
 
-# kick off the update loop before mainloop
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
+# Start the preview refresh and UI callback pump before entering Tk mainloop.
 update_preview()
 _pump_ui_queue()
 
