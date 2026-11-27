@@ -9,8 +9,12 @@ multi-monitor support, live preview, and FFmpeg-encoded output.
 
 ## Features
 
--   **Timestamp-based audio/video synchronization** to reduce drift
-    during longer recordings.
+-   **Improved timestamp-based audio/video synchronization:** microphone
+    and system-audio chunks are reconstructed in continuous groups to
+    reduce audio artifacts caused by callback timestamp variations.
+    Paused intervals are excluded from the final timeline.
+-   **DXcam-based screen capture:** efficient DXGI frame capture with
+    timestamped frames and a constant 30 FPS output timeline.
 -   **Flexible audio recording:** microphone, system audio via WASAPI
     (no Stereo Mix required), or both.
 -   **Multi-monitor support:** choose which display to record and
@@ -105,7 +109,10 @@ Before publishing a release, test the extracted package on a Windows
 machine that does not have the project's Python dependencies installed.
 
 ## AI Assistance
-This project is primarily human-written. AI coding assistants (Claude) were used for specific portions, and every AI-assisted change was reviewed, tested, and integrated by the author.
+
+AI tools were used to assist with selected debugging, code review,
+and documentation tasks. All final changes were reviewed and tested
+by the author..
 
 ## Third-Party Software
 This application bundles FFmpeg. For licensing information, please see [LICENSES.md](LICENSES.md).
