@@ -27,6 +27,8 @@ multi-monitor support, live preview, and FFmpeg-encoded output.
 -   **Optional extra compression** to reduce the final file size.
 -   **Crash-aware cleanup and error handling** for temporary files and
     background recording tasks.
+-   **Audio failure handling:** Detect microphone and system-audio failures separately. Successfully captured audio can still be saved when        another selected source fails, and video-only saving remains possible.
+-   **Save failure recovery:** When recording or final saving fails, choose whether to keep or delete the temporary recording files.
 
 ## Download (Recommended)
 
@@ -61,7 +63,7 @@ source code instead of using the prepared standalone package.
 ### Requirements
 
 -   Windows 10 or Windows 11
--   A compatible Python version
+-   Python 3.10 or newer
 -   FFmpeg on `PATH`, or `ffmpeg.exe` placed next to the script
 -   The Python packages listed in `requirements.txt`
 
@@ -103,7 +105,7 @@ Before publishing a release, test the extracted package on a Windows
 machine that does not have the project's Python dependencies installed.
 
 ## AI Assistance
-This project is primarily human-written. AI coding assistants (Claude) were used for specific portions — including [refactoring / documentation / debugging / boilerplate], and every AI-assisted change was reviewed, tested, and integrated by the author.
+This project is primarily human-written. AI coding assistants (Claude) were used for specific portions, and every AI-assisted change was reviewed, tested, and integrated by the author.
 
 ## Third-Party Software
 This application bundles FFmpeg. For licensing information, please see [LICENSES.md](LICENSES.md).
