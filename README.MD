@@ -112,7 +112,7 @@ machine that does not have the project's Python dependencies installed.
 
 AI tools were used to assist with selected debugging, code review,
 and documentation tasks. All final changes were reviewed and tested
-by the author..
+by the author.
 
 ## Third-Party Software
 This application bundles FFmpeg. For licensing information, please see [LICENSES.md](LICENSES.md).
