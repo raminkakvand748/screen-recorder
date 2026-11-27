@@ -1,51 +1,139 @@
+# Screen Recorder
+
+A lightweight screen recorder for Windows, written in Python. It
+provides full-screen capture, timestamp-based audio/video
+synchronization, pause/resume without splitting the recording,
+multi-monitor support, live preview, and FFmpeg-encoded output.
+
+**No watermarks. No time limits.**
+
 ## Features
 
-- **Full-screen capture** using `mss` (and a low-latency `dxcam` preview).
-- **Flexible audio recording**: Capture Microphone, System Audio via WASAPI (no Stereo Mix required), or mix both together seamlessly.
-- **Multi-monitor support**: Choose which display to record and preview from a dropdown menu.
-- **Pause / Resume** without breaking the output file or audio sync.
-- **Real-time preview** toggle (hidden automatically during recording).
-- **Quality presets**: 1080p, 720p, 480p.
-- **Eight output formats**: MP4 (H.264), MKV, MOV, AVI (MPEG-4), TS, FLV, WEBM (VP9), and WMV.
-- **Optional extra compression**: A one-click checkbox to re-encode the final file with a slower preset for maximum file size reduction.
-- **Crash-safe**: temporary files are cleaned up automatically; broken pipes and background thread errors are caught and shown via UI dialogs.
+-   **Timestamp-based audio/video synchronization** to reduce drift
+    during longer recordings.
+-   **Flexible audio recording:** microphone, system audio via WASAPI
+    (no Stereo Mix required), or both.
+-   **Multi-monitor support:** choose which display to record and
+    preview.
+-   **Pause / Resume** without splitting the output file.
+-   **Recording status indicator:** see when the app is Ready,
+    Recording, Paused, Finalizing, Saving, Compressing, Saved, or when
+    saving fails.
+-   **Live preview** that can be toggled and is hidden automatically
+    during recording.
+-   **Quality presets:** 1080p, 720p, and 480p.
+-   **Multiple output formats:** MP4 (H.264), MKV, MOV, AVI (MPEG-4),
+    TS, FLV, WEBM (VP9), and WMV.
+-   **Optional extra compression** to reduce the final file size.
+-   **Crash-aware cleanup and error handling** for temporary files and
+    background recording tasks.
 
-## Requirements
+## Download (Recommended)
 
-- **Windows 10/11**
-- **FFmpeg** on `PATH`, or `ffmpeg.exe` next to the script.
+You can use the prepared Windows standalone package without installing
+Python or manually installing the project's Python dependencies.
 
-Install the Python dependencies via pip:
-```bash
-pip install -r requirements.txt
+1.  Open the [latest GitHub
+    Release](https://github.com/raminkakvand748/screen-recorder/releases/latest).
+2.  Download the standalone package from the release **Assets**. It is a
+    folder-based distribution packaged for download, not a single-file
+    executable.
+3.  Extract the downloaded archive.
+4.  Open the extracted application folder (the `.dist` folder/package).
+5.  Run the `.exe` file inside that folder.
 
-## Installation & Usage
+**Important:** Run the executable from inside the extracted folder. Keep
+the other files and folders that came with the package in place; the
+executable may need them to start correctly. Do not move only the `.exe`
+to another location.
 
-```bash
+You do **not** need to install Python or run
+`pip install -r requirements.txt` when using the standalone package.
+
+> If you do not see a standalone package under the latest release's
+> **Assets**, it has not been attached to that release yet.
+
+## Alternative: Run from Python Source
+
+Choose this option if you want to inspect, modify, or run the Python
+source code instead of using the prepared standalone package.
+
+### Requirements
+
+-   Windows 10 or Windows 11
+-   A compatible Python version
+-   FFmpeg on `PATH`, or `ffmpeg.exe` placed next to the script
+-   The Python packages listed in `requirements.txt`
+
+### Installation
+
+Clone or download this repository, open a terminal in the project
+folder, and run:
+
+``` bash
 pip install -r requirements.txt
 python screen_recorder.py
 ```
 
-Enter a filename, pick **format** and **quality**, press **●** to record, **■** to stop and save.
+## Usage
 
-| Button | Action |
-|--------|--------|
-| ● | Start recording |
-| ⏸ / ▶ | Pause / Resume |
-| ■ | Stop and save |
-| 👁 | Toggle preview |
-| x | Close app |
+1.  Launch the application.
+2.  Enter a filename and choose the output format and quality.
+3.  Select the monitor and audio source.
+4.  Press **●** to start recording.
+5.  Use **⏸ / ▶** to pause and resume.
+6.  Press **■** to stop and save.
+
+  Button   Action
+  -------- -----------------------
+  ●        Start recording
+  ⏸ / ▶    Pause / Resume
+  ■        Stop and save
+  👁        Toggle preview
+  x        Close the application
 
 ## Building a Standalone Executable
 
 ```bash
 pip install nuitka
+python -m nuitka --standalone --enable-plugin=tk-inter ^
+  --windows-console-mode=disable ^
+  --include-data-files="C:\path\to\ffmpeg.exe=ffmpeg.exe" ^
+  screen_recorder.py
+```
+
+## Building the Standalone Package
+
+The standalone package is built with Nuitka. This section is for
+developers preparing a release; regular users should follow the
+**Download** instructions above.
+
+Install Nuitka:
+
+``` bash
+pip install nuitka
+```
+
+Build command (adjust the FFmpeg path if needed):
+
+``` bash
 python -m nuitka --standalone --enable-plugin=tk-inter --windows-console-mode=disable --include-package=comtypes --include-package=soundcard --include-package=dxcam --include-package=sounddevice --include-package=cffi --include-module=_cffi_backend --include-package-data=soundcard --include-data-files="C:\path\to\ffmpeg.exe=ffmpeg.exe" screen_recorder.py
 ```
 
-## AI Assistance
+Nuitka creates a `.dist` directory containing the executable and its
+supporting files. For distribution, package the entire directory (for
+example, as a ZIP archive) and upload that archive to the GitHub
+Release. Users should extract the archive and run the executable from
+inside the extracted `.dist` folder. Do not distribute only the `.exe`.
 
+Before publishing a release, test the extracted package on a Windows
+machine that does not have the project's Python dependencies installed.
+
+## AI Assistance
 This project is primarily human-written. AI coding assistants (Claude) were used for specific portions — including [refactoring / documentation / debugging / boilerplate], and every AI-assisted change was reviewed, tested, and integrated by the author.
 
 ## Third-Party Software
 This application bundles FFmpeg. For licensing information, please see [LICENSES.md](LICENSES.md).
+
+## License
+See [LICENSE](LICENSE).
