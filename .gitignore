@@ -26,4 +26,11 @@ Desktop.ini
 *.mp4
 *.avi
 *.wav
+*.mkv
+*.mov
+*.ts
+*.flv
+*.webm
+*.wmv
+ffmpeg.exe
 screenrec_*/
