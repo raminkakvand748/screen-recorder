@@ -75,23 +75,6 @@ pip install -r requirements.txt
 python screen_recorder.py
 ```
 
-## Usage
-
-1.  Launch the application.
-2.  Enter a filename and choose the output format and quality.
-3.  Select the monitor and audio source.
-4.  Press **●** to start recording.
-5.  Use **⏸ / ▶** to pause and resume.
-6.  Press **■** to stop and save.
-
-  Button   Action
-  -------- -----------------------
-  ●        Start recording
-  ⏸ / ▶    Pause / Resume
-  ■        Stop and save
-  👁        Toggle preview
-  x        Close the application
-
 ## Building a Standalone Executable
 
 ```bash
