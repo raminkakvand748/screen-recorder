@@ -75,16 +75,6 @@ pip install -r requirements.txt
 python screen_recorder.py
 ```
 
-## Building a Standalone Executable
-
-```bash
-pip install nuitka
-python -m nuitka --standalone --enable-plugin=tk-inter ^
-  --windows-console-mode=disable ^
-  --include-data-files="C:\path\to\ffmpeg.exe=ffmpeg.exe" ^
-  screen_recorder.py
-```
-
 ## Building the Standalone Package
 
 The standalone package is built with Nuitka. This section is for
