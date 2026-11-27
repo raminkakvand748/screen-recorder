@@ -100,12 +100,23 @@ format = ""          # ".mp4" or ".avi", set by UI
 SAMPLE_RATE = 44100
 CHANNELS    = 2
 DTYPE       = "int16"
-mic_frames  = []
+# Each item: (perf_counter_time_of_first_sample, audio_chunk)
+mic_frames = []
 loop_frames = []
-audio_lock   = threading.Lock()
+audio_lock = threading.Lock()
+
+# Maps PortAudio stream time to time.perf_counter().
+mic_clock_offset = None
+
+# Host-clock time of the first captured video frame.
+recording_epoch = None
+
+# Completed pause intervals: [(pause_start, pause_end), ...]
+pause_intervals = []
 
 audio_source_devices = []        # [(device_index, label), ...] populated at startup
 selected_mic_idx     = None      # device index for the mic (None = default)
+default_mic_idx = None
 selected_loopback_idx = None     # device index for system-audio loopback (None = unavailable)
 audio_mode           = "mic"     # "mic" | "system" | "mic+system"
 
@@ -125,6 +136,8 @@ pause_mark = None
 pause_lock = threading.Lock()
 audio_started = threading.Event()
 capture_ready = threading.Event()
+capture_paused = threading.Event()
+capture_paused.set()  # Safe until the capture thread starts producing frames.
 system_ready = threading.Event()
 audio_failed = threading.Event()
 encoder_failed = threading.Event()
@@ -134,10 +147,14 @@ recording       = False
 recording_finishing = False     
 preview_was_on      = False 
 save_requested  = False
+discard_requested = False
 dropped_frames  = 0
 captured_frames = 0
 encoded_frames  = 0
 compress_final = False
+
+_close_when_session_done = False
+_ui_sync_done = True
 
 # --------------------------------------------------------------------------
 # Multi-monitor preview (DXGI-based, independent of recording capture)
@@ -213,7 +230,7 @@ def toggle_preview():
     # only blocks the user clicking 👁 while a session is active — which
     # is exactly what we want: the preview would otherwise land in the
     # recording because capture() grabs the whole screen.
-    if recording:
+    if recording or recording_finishing:
         return
 
     if preview_enabled.is_set():
@@ -299,54 +316,278 @@ def _cleanup_temps():
         shutil.rmtree(d, ignore_errors=True)
 atexit.register(_cleanup_temps)
 
+def _active_time_from_perf(perf_time, epoch, pauses):
+    """Convert host-clock time into active recording time."""
+    paused_duration = 0.0
+
+    for pause_start, pause_end in pauses:
+        overlap_start = max(epoch, pause_start)
+        overlap_end = min(perf_time, pause_end)
+
+        if overlap_end > overlap_start:
+            paused_duration += overlap_end - overlap_start
+
+    return max(0.0, perf_time - epoch - paused_duration)
+
+
+def _snapshot_pause_intervals():
+    """Get completed pauses, including a currently active pause."""
+    with pause_lock:
+        pauses = list(pause_intervals)
+
+        if pause_mark is not None:
+            pause_end = time.perf_counter()
+            if pause_end > pause_mark:
+                pauses.append((pause_mark, pause_end))
+
+    return sorted(pauses)
+
+
+def _assemble_timed_audio(chunks, epoch, pauses):
+    """
+    Reconstruct audio while preserving sample continuity.
+
+    Consecutive chunks are joined together rather than independently
+    positioned using potentially jittery callback timestamps.
+
+    Timestamps are used to position continuous groups and remove pauses.
+    """
+    empty = np.zeros((0, CHANNELS), dtype=np.int16)
+
+    if epoch is None or not chunks:
+        return empty
+
+    # Normalize and sort chunks by their estimated starting timestamps.
+    normalized = []
+
+    for chunk_start, chunk in chunks:
+        data = np.asarray(chunk)
+
+        if data.ndim == 1:
+            data = data.reshape(-1, 1)
+
+        if data.shape[1] == 1:
+            data = np.repeat(data, CHANNELS, axis=1)
+        elif data.shape[1] > CHANNELS:
+            data = data[:, :CHANNELS]
+
+        data = data.astype(np.int16, copy=False)
+
+        if len(data):
+            normalized.append((float(chunk_start), data))
+
+    normalized.sort(key=lambda item: item[0])
+
+    if not normalized:
+        return empty
+
+    # Group consecutive chunks together.
+    # Small timestamp variations must not create gaps or overlaps.
+    groups = []
+
+    group_start = normalized[0][0]
+    group_parts = [normalized[0][1]]
+
+    previous_start = normalized[0][0]
+    previous_length = len(normalized[0][1])
+
+    gap_limit = 0.050  # 50 ms
+
+    for chunk_start, data in normalized[1:]:
+
+        expected_next = (
+            previous_start + previous_length / SAMPLE_RATE
+        )
+
+        gap = chunk_start - expected_next
+
+        # Explicitly split groups across pause intervals.
+        crossed_pause = any(
+            pause_start < chunk_start
+            and pause_end > previous_start
+            for pause_start, pause_end in pauses
+        )
+
+        if abs(gap) > gap_limit or crossed_pause:
+
+            groups.append((
+                group_start,
+                np.concatenate(group_parts, axis=0)
+            ))
+
+            group_start = chunk_start
+            group_parts = [data]
+
+        else:
+            # Preserve exact sample continuity.
+            group_parts.append(data)
+
+        previous_start = chunk_start
+        previous_length = len(data)
+
+    # Save the final group.
+    groups.append((
+        group_start,
+        np.concatenate(group_parts, axis=0)
+    ))
+
+    segments = []
+
+    # Position each continuous group on the active recording timeline.
+    for group_start, data in groups:
+
+        frame_count = len(data)
+
+        # Remove samples before the first video frame.
+        first_index = max(
+            0,
+            int(np.ceil(
+                (epoch - group_start) * SAMPLE_RATE
+            ))
+        )
+
+        if first_index >= frame_count:
+            continue
+
+        cursor = first_index
+
+        def add_segment(start_index, end_index):
+
+            if end_index <= start_index:
+                return
+
+            segment_perf = (
+                group_start + start_index / SAMPLE_RATE
+            )
+
+            active_start = _active_time_from_perf(
+                segment_perf,
+                epoch,
+                pauses
+            )
+
+            output_start = int(round(
+                active_start * SAMPLE_RATE
+            ))
+
+            segments.append((
+                output_start,
+                data[start_index:end_index]
+            ))
+
+        # Remove samples captured during pauses.
+        for pause_start, pause_end in pauses:
+
+            pause_first = max(
+                first_index,
+                int(np.ceil(
+                    (pause_start - group_start) * SAMPLE_RATE
+                ))
+            )
+
+            pause_last = min(
+                frame_count,
+                int(np.ceil(
+                    (pause_end - group_start) * SAMPLE_RATE
+                ))
+            )
+
+            if pause_last <= cursor:
+                continue
+
+            if pause_first > cursor:
+                add_segment(cursor, pause_first)
+
+            cursor = max(cursor, pause_last)
+
+            if cursor >= frame_count:
+                break
+
+        if cursor < frame_count:
+            add_segment(cursor, frame_count)
+
+    if not segments:
+        return empty
+
+    # Create the final audio timeline.
+    total_samples = max(
+        start + len(segment)
+        for start, segment in segments
+    )
+
+    result = np.zeros(
+        (total_samples, CHANNELS),
+        dtype=np.int16
+    )
+
+    written = np.zeros(total_samples, dtype=bool)
+
+    # Preserve the first samples written in overlapping regions.
+    for start, segment in sorted(
+        segments,
+        key=lambda item: item[0]
+    ):
+
+        end = start + len(segment)
+
+        region = result[start:end]
+        written_region = written[start:end]
+
+        new_samples = ~written_region
+
+        region[new_samples] = segment[new_samples]
+        written_region[new_samples] = True
+
+    return result
+
 # --------------------------------------------------------------------------
 # Timestamped screen-capture thread
 # --------------------------------------------------------------------------
 
 def capture():
-    """Capture frames with DXcam and preserve active-recording timestamps."""
+    """Capture video frames and timestamp them against the shared clock."""
     global dropped_frames, captured_frames, capture_duration
+    global recording_epoch
 
-    need_resize = (output_width, output_height) != (capture_width, capture_height)
-    active_elapsed = 0.0
-    last_tick = time.perf_counter()
+    need_resize = (
+        (output_width, output_height) !=
+        (capture_width, capture_height)
+    )
+
     last_frame_time = 0.0
     camera = None
 
     try:
-        # MSS monitor indices are 1-based; DXcam output indices are 0-based.
         output_idx = max(0, selected_monitor_idx - 1)
-
-        # Reuse the existing cached DXcam camera.
         camera = _get_preview_camera(output_idx)
 
         if camera is None:
             raise RuntimeError("Could not initialize DXcam.")
 
-        # DXcam handles frame pacing in its own capture thread.
-        camera.start(target_fps=int(round(fps)), video_mode=True)
+        camera.start(
+            target_fps=int(round(fps)),
+            video_mode=True
+        )
 
         while not stop_event.is_set():
-            now = time.perf_counter()
 
             if pause_event.is_set():
-                last_tick = now
+                capture_paused.set()
                 time.sleep(0.02)
                 continue
 
-            active_elapsed += now - last_tick
-            last_tick = now
+            capture_paused.clear()
 
-            # Wait for the next frame from DXcam.
             frame = camera.get_latest_frame()
 
             if frame is None:
                 time.sleep(0.005)
                 continue
 
-            # Don't enqueue a frame if recording was paused while waiting.
+            frame_perf = time.perf_counter()
+
             if pause_event.is_set():
-                last_tick = time.perf_counter()
+                capture_paused.set()
                 continue
 
             if need_resize:
@@ -356,8 +597,25 @@ def capture():
                     interpolation=cv2.INTER_LINEAR
                 )
 
-            # Keep the existing active-recording timestamp system.
-            frame_time = active_elapsed + (time.perf_counter() - now)
+            if pause_event.is_set():
+                capture_paused.set()
+                continue
+
+            # The first captured frame establishes timeline zero.
+            if recording_epoch is None:
+                recording_epoch = frame_perf
+                frame_time = 0.0
+            else:
+                with pause_lock:
+                    pauses = tuple(pause_intervals)
+
+                frame_time = _active_time_from_perf(
+                    frame_perf,
+                    recording_epoch,
+                    pauses
+                )
+
+            last_frame_time = frame_time
 
             try:
                 Frames.put_nowait((frame, frame_time))
@@ -365,7 +623,6 @@ def capture():
                 dropped_frames += 1
             else:
                 captured_frames += 1
-                last_frame_time = frame_time
                 capture_ready.set()
 
     except Exception as e:
@@ -374,24 +631,16 @@ def capture():
         stop_event.set()
 
     finally:
+        capture_paused.set()
+
         if camera is not None:
             try:
                 camera.stop()
             except Exception as e:
                 print(f"DXcam stop warning: {e}")
 
-        # Preserve the original recording-duration calculation.
-        if not pause_event.is_set():
-            capture_duration = max(
-                last_frame_time,
-                active_elapsed + (time.perf_counter() - last_tick)
-            )
-        else:
-            capture_duration = last_frame_time
-
+        capture_duration = last_frame_time
         capture_finished.set()
-
-
 
 # --------------------------------------------------------------------------
 # Constant-frame-rate encoder thread
@@ -453,17 +702,71 @@ def encode(proc):
 # Microphone and system-audio workers
 # --------------------------------------------------------------------------
 def _audio_callback(indata, frame_count, time_info, status, target):
-    """Append a microphone chunk when capture is active and not paused.
+    """Store microphone chunks with their actual capture timestamps."""
+    global mic_clock_offset
 
-    The callback is invoked by PortAudio. It copies each accepted chunk so
-    the audio backend can safely reuse its input buffer.
-    """
     if status:
         print(status)
-    if stop_event.is_set() or not capture_ready.is_set() or pause_event.is_set():
+
+        if getattr(status, "input_overflow", False):
+            audio_failed.set()
+
+    if stop_event.is_set() or not capture_ready.is_set():
         return
+
+    if mic_clock_offset is None:
+        return
+
+    callback_perf = time.perf_counter()
+
+    try:
+        adc_time = float(time_info.inputBufferAdcTime)
+
+        if np.isfinite(adc_time) and adc_time > 0:
+            chunk_start_perf = adc_time + mic_clock_offset
+        else:
+            current_time = float(time_info.currentTime)
+
+            if np.isfinite(current_time) and current_time > 0:
+                chunk_start_perf = (
+                    current_time
+                    + mic_clock_offset
+                    - frame_count / SAMPLE_RATE
+                )
+            else:
+                chunk_start_perf = (
+                    callback_perf - frame_count / SAMPLE_RATE
+                )
+
+    except (AttributeError, TypeError, ValueError):
+        chunk_start_perf = (
+            callback_perf - frame_count / SAMPLE_RATE
+        )
+
+    if not np.isfinite(chunk_start_perf):
+        audio_failed.set()
+        return
+
+    # Avoid storing chunks captured entirely during a pause.
+    if pause_event.is_set():
+        with pause_lock:
+            current_pause_start = pause_mark
+
+        if (
+            current_pause_start is None
+            or chunk_start_perf >= current_pause_start
+        ):
+            return
+
+    audio_chunk = indata.copy()
+
+    if audio_chunk.shape[1] == 1:
+        audio_chunk = np.repeat(
+            audio_chunk, CHANNELS, axis=1
+        )
+
     with audio_lock:
-        target.append(indata.copy())
+        target.append((chunk_start_perf, audio_chunk))
 
 def enumerate_audio_devices():
     """Build the audio-source dropdown entries from available input devices.
@@ -472,7 +775,7 @@ def enumerate_audio_devices():
     offered separately through WASAPI loopback, with a combined option when
     both microphone and system audio are wanted.
     """
-    global audio_source_devices, selected_mic_idx
+    global audio_source_devices, selected_mic_idx, default_mic_idx
 
     try:
         devices = sounddevice.query_devices()
@@ -486,18 +789,30 @@ def enumerate_audio_devices():
             if "stereo mix" not in d["name"].lower():
                 mics.append(i)
 
-    selected_mic_idx = mics[0] if mics else None
+    try:
+        preferred_default = sounddevice.default.device[0]
+    except Exception:
+        preferred_default = None
+
+    default_mic_idx = (
+        preferred_default if preferred_default in mics
+        else (mics[0] if mics else None)
+    )
+
+    selected_mic_idx = default_mic_idx
 
     audio_source_devices = []
-    if selected_mic_idx is not None:
+
+    if default_mic_idx is not None:
         audio_source_devices.append(("Microphone (default)", "mic"))
-    
+
     # System audio is ALWAYS available now, thanks to WASAPI
     audio_source_devices.append(("System audio (WASAPI)", "system"))
     audio_source_devices.append(("Microphone + System audio", "mic+system"))
-        
-    for i in mics[1:]:
-        audio_source_devices.append((f"Mic: {devices[i]['name'][:40]}", i))
+
+    for i in mics:
+        if i != default_mic_idx:
+            audio_source_devices.append((f"Mic: {devices[i]['name'][:40]}", i))
 
 def _record_system_audio_thread():
     """Record system audio, synchronized with video capture."""
@@ -534,14 +849,32 @@ def _record_system_audio_thread():
 
             while not stop_event.is_set():
                 data = recorder.record(numframes=1024)
+                read_end = time.perf_counter()
+
+                if data is None or len(data) == 0:
+                    continue
+
+                chunk_start_perf = (
+                    read_end - len(data) / SAMPLE_RATE
+                )
 
                 if pause_event.is_set():
-                    continue
+                    with pause_lock:
+                        current_pause_start = pause_mark
+
+                    if (
+                        current_pause_start is None
+                        or chunk_start_perf >= current_pause_start
+                    ):
+                        continue
 
                 chunk_int16 = (data * 32767).astype(np.int16)
 
                 with audio_lock:
-                    loop_frames.append(chunk_int16)
+                    loop_frames.append((
+                        chunk_start_perf,
+                        chunk_int16
+                    ))
 
     except Exception as e:
         print(RED + f"WASAPI Loopback failed: {e}" + RESET)
@@ -553,6 +886,10 @@ def _record_system_audio_thread():
 
 def record_audio(path):
     """Record from the selected source (mic, system loopback, or both)."""
+
+    global mic_clock_offset
+    mic_clock_offset = None
+
     print(RED + "recording..." + RESET)
 
     streams = []
@@ -561,11 +898,27 @@ def record_audio(path):
     # 1. Setup Microphone (still uses sounddevice)
     if audio_mode in ("mic", "mic+system") and selected_mic_idx is not None:
         try:
+            device_info = sounddevice.query_devices(selected_mic_idx)
+            mic_channels = min(
+                CHANNELS,
+                int(device_info["max_input_channels"])
+            )
+
+            if mic_channels < 1:
+                raise RuntimeError(
+                    "The selected microphone has no input channels."
+                )
+
             streams.append(sounddevice.InputStream(
-                samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE,
+                samplerate=SAMPLE_RATE,
+                channels=mic_channels,
+                dtype=DTYPE,
                 device=selected_mic_idx,
-                callback=lambda *a: _audio_callback(*a, target=mic_frames),
+                callback=lambda *a: _audio_callback(
+                    *a, target=mic_frames
+                ),
             ))
+
         except Exception as e:
             print(RED + f"Microphone setup failed: {e}" + RESET)
             audio_failed.set()
@@ -592,6 +945,21 @@ def record_audio(path):
     for s in streams:
         try:
             s.start()
+
+            # Map PortAudio's clock to time.perf_counter().
+            before = time.perf_counter()
+            stream_time = s.time
+            after = time.perf_counter()
+
+            mic_clock_offset = (
+                (before + after) / 2.0
+            ) - stream_time
+
+            print(
+                f"Microphone clock calibrated: "
+                f"{mic_clock_offset:.6f}s"
+            )
+
         except Exception as e:
             print(RED + f"Microphone startup failed: {e}" + RESET)
             audio_failed.set()
@@ -623,8 +991,27 @@ def record_audio(path):
         
     # 5. Mix the buffers (unchanged from your current code)
     with audio_lock:
-        mic  = np.concatenate(mic_frames,  axis=0) if mic_frames  else np.zeros((0, CHANNELS), np.int16)
-        loop = np.concatenate(loop_frames, axis=0) if loop_frames else np.zeros((0, CHANNELS), np.int16)
+        mic_chunks = list(mic_frames)
+        loop_chunks = list(loop_frames)
+
+    pauses = _snapshot_pause_intervals()
+
+    mic = _assemble_timed_audio(
+        mic_chunks,
+        recording_epoch,
+        pauses
+    )
+
+    loop = _assemble_timed_audio(
+        loop_chunks,
+        recording_epoch,
+        pauses
+    )
+
+    print(
+        f"Aligned microphone: {len(mic) / SAMPLE_RATE:.2f}s, "
+        f"system audio: {len(loop) / SAMPLE_RATE:.2f}s"
+    )
 
     # Check whether every selected source actually produced audio.
     if audio_mode in ("mic", "mic+system") and len(mic) == 0:
@@ -783,7 +1170,7 @@ def build_compress_cmd(ffmpeg_path, in_video, in_audio, out_path, has_audio):
             "-i", in_audio,
             "-map", "0:v:0", "-map", "1:a:0",
             *vcodec,
-            "-af", "aresample=async=1:min_hard_comp=0.100:first_pts=0",
+            "-af", "aresample=async=1:min_hard_comp=0.100:first_pts=0,apad",
             *acodec,
             "-shortest",
         ]
@@ -926,6 +1313,19 @@ def session():
         elapsed = time.perf_counter() - start_time
 
         if rc != 0 or encoder_failed.is_set() or capture_failed.is_set():
+
+            # An intentional discard must never ask to keep temporary files.
+            if discard_requested:
+                print(RED + "Recording discarded after shutdown error." + RESET)
+
+                shutil.rmtree(tmpdir, ignore_errors=True)
+
+                if tmpdir in _tempdirs:
+                    _tempdirs.remove(tmpdir)
+
+                ui_post(lambda: set_status("Discarded", "#aaaaaa"))
+                return
+
             if capture_failed.is_set():
                 error = "Screen capture failed unexpectedly."
             elif encoder_failed.is_set():
@@ -1013,7 +1413,7 @@ def session():
                     "-map", "0:v:0",
                     "-map", "1:a:0",
                     "-c:v", "copy",
-                    "-af", "aresample=async=1:min_hard_comp=0.100:first_pts=0",
+                    "-af", "aresample=async=1:min_hard_comp=0.100:first_pts=0,apad",
                     *acodec,
                     "-shortest",
                     out_path,
@@ -1154,8 +1554,10 @@ entry.pack(side="left", padx=5)
 
 def start_record():
     """Validate the selected options, reset state, and launch a session."""
-    global session_thread, recording, filename, save_requested, pause_mark, pause_accum
-    global preview_was_on, compress_final
+    global session_thread, recording, filename, save_requested, discard_requested
+    global pause_mark, pause_accum, preview_was_on, compress_final
+    global _ui_sync_done, _close_when_session_done
+    global recording_epoch, mic_clock_offset
 
     if recording or recording_finishing:
         return
@@ -1177,15 +1579,22 @@ def start_record():
 
     filename = re.sub(r'[<>:"/\\|?*]', "_", name)
     save_requested = False
+    discard_requested = False
     stop_event.clear()
     pause_event.clear()
     audio_started.clear()
     capture_ready.clear()
+    capture_paused.clear()
     system_ready.clear()
     encoder_failed.clear()
     capture_failed.clear()
-    pause_accum = 0.0
-    pause_mark = None
+    with pause_lock:
+        pause_accum = 0.0
+        pause_mark = None
+        pause_intervals.clear()
+
+    recording_epoch = None
+    mic_clock_offset = None
 
     preview_was_on = preview_enabled.is_set()
     if preview_was_on:
@@ -1204,63 +1613,156 @@ def start_record():
 
     compress_final = compress_var.get()
 
+    _ui_sync_done = False
+    _close_when_session_done = False
+
+    _set_recording_options_enabled(False)
+
     recording = True
     set_status("Recording", "#ff5555")
     session_thread = threading.Thread(target=session, daemon=True)
     session_thread.start()
 
-def stop_recording():
-    """Ask for the output path and signal the active session to stop."""
-    global recording, filename, save_requested, recording_finishing
+def stop_recording(close_when_done=False):
+    """Pause first, then let the user save, discard, or resume."""
+    global recording, filename, save_requested, discard_requested
+    global recording_finishing, _close_when_session_done
+    global pause_mark, pause_accum
 
     if not recording or recording_finishing:
-        return
+        return False
 
-    if not pause_event.is_set():
+    # Remember whether the user had already paused the recording.
+    was_already_paused = pause_event.is_set()
+
+    # Pause before displaying any dialogs.
+    if not was_already_paused:
         toggle_pause()
 
-    save_path = filedialog.asksaveasfilename(
-        parent=window, title="Save recording",
-        initialfile=entry.get().strip() or "recording",
-        defaultextension=format,
-        filetypes=[(f"{format[1:].upper()} video", f"*{format}"),
-                   ("All files", "*.*")],
+    # Wait until capture confirms it has stopped supplying frames.
+    if not capture_paused.wait(timeout=2.0):
+        if not was_already_paused:
+            toggle_pause()
+
+        print("[Stop] Could not confirm that capture paused.")
+        return False
+
+    choice = messagebox.askyesnocancel(
+        "Stop recording",
+        "What would you like to do with this recording?\n\n"
+        "Yes: Save the recording\n"
+        "No: Discard the recording\n"
+        "Cancel: Continue recording",
+        parent=window,
     )
-    if save_path:
+
+    # Cancel: resume only if recording was previously running.
+    if choice is None:
+        if not was_already_paused:
+            toggle_pause()
+        return False
+
+    if choice:
+        save_path = filedialog.asksaveasfilename(
+            parent=window,
+            title="Save recording",
+            initialfile=entry.get().strip() or "recording",
+            defaultextension=format,
+            filetypes=[
+                (f"{format[1:].upper()} video", f"*{format}"),
+                ("All files", "*.*"),
+            ],
+        )
+
+        # Cancelling Save As also resumes the recording.
+        if not save_path:
+            if not was_already_paused:
+                toggle_pause()
+            return False
+
         filename = os.path.splitext(save_path)[0]
         save_requested = True
+        discard_requested = False
+        final_status = "Finalizing..."
+
     else:
         save_requested = False
+        discard_requested = True
+        final_status = "Discarding..."
 
+    # Finish the final pause interval before ending the timeline.
+    with pause_lock:
+        if pause_mark is not None:
+            pause_end = time.perf_counter()
+
+            pause_intervals.append((pause_mark, pause_end))
+            pause_accum += pause_end - pause_mark
+            pause_mark = None
+
+    # Capture and audio are already paused. Now end the session.
     stop_event.set()
     pause_event.clear()
-    set_status("Finalizing...", "#e5b567")
-    pause_btn.config(state="disabled", text="⏸", font=("Arial", 14), fg="#ff5555",
-               bg=BUTTON_BG, activebackground="#505050", activeforeground=FG,
-               relief="flat")
+
     recording = False
     recording_finishing = True
-    _poll_session_done()
+    _close_when_session_done = close_when_done
 
+    set_status(final_status, "#e5b567")
+
+    pause_btn.config(
+        state="disabled",
+        text="⏸",
+        font=("Arial", 14),
+        fg="#ff5555",
+        bg=BUTTON_BG,
+        activebackground="#505050",
+        activeforeground=FG,
+        relief="flat",
+    )
+
+    _poll_session_done()
+    return True
 
 def _ui_sync_after_session():
-    """Restore the toolbar to idle. Safe to call more than once — every
-    write below is idempotent, so double-invocation (e.g., both the poller
-    and session()'s finally firing) is harmless."""
+    """Restore the UI once the session worker has completely finished."""
     global recording_finishing, preview_was_on
+    global _ui_sync_done, _close_when_session_done
 
+    if _ui_sync_done:
+        return
+
+    _ui_sync_done = True
     recording_finishing = False
 
     if pause_btn["state"] == "normal":
-        pause_btn.config(state="disabled", text="⏸",
-                          fg="#ff5555", bg=BUTTON_BG,
-                          activebackground="#505050",
-                          activeforeground=FG, relief="flat")
+        pause_btn.config(
+            state="disabled",
+            text="⏸",
+            fg="#ff5555",
+            bg=BUTTON_BG,
+            activebackground="#505050",
+            activeforeground=FG,
+            relief="flat"
+        )
+
+    _set_recording_options_enabled(True)
+
+    # Fix status when recording fails to start.
+    if status_label.cget("text") in ("Recording", "Finalizing..."):
+        set_status("Ready", "#aaaaaa")
+
+    # Close only after the session has completely finished.
+    if _close_when_session_done:
+        _close_when_session_done = False
+        preview_was_on = False
+        preview_enabled.clear()
+        window.destroy()
+        return
 
     if preview_was_on and not preview_enabled.is_set():
         toggle_preview()
-    preview_was_on = False
 
+    preview_was_on = False
 
 def _poll_session_done():
     """Non-blocking wait for session_thread to drain — keeps Tk responsive
@@ -1271,29 +1773,43 @@ def _poll_session_done():
     _ui_sync_after_session()
 
 def close_app():
-    """Stop active workers, release preview resources, and close the window."""
-    global recording, recording_finishing
-    stop_event.set()
-    recording = False
-    recording_finishing = False
-    pause_event.clear()
+    """Close safely, asking whether to save or discard an active recording."""
+    global _close_when_session_done
+
+    if recording:
+        stop_recording(close_when_done=True)
+        return
+
+    if recording_finishing:
+        _close_when_session_done = True
+        preview_enabled.clear()
+        return
+
+    if session_thread is not None and session_thread.is_alive():
+        _close_when_session_done = True
+        preview_enabled.clear()
+        return
 
     preview_enabled.clear()
+
     if preview_thread is not None and preview_thread.is_alive():
         preview_thread.join(timeout=2.0)
 
-    if session_thread and session_thread.is_alive():
-        window.after(100, _wait_for_session_and_close)
+    if preview_thread is not None and preview_thread.is_alive():
+        window.after(100, _wait_for_preview_and_close)
         return
 
     window.destroy()
 
 
-def _wait_for_session_and_close():
-    if session_thread and session_thread.is_alive():
-        window.after(100, _wait_for_session_and_close)
+def _wait_for_preview_and_close():
+    if preview_thread is not None and preview_thread.is_alive():
+        window.after(100, _wait_for_preview_and_close)
     else:
         window.destroy()
+
+
+window.protocol("WM_DELETE_WINDOW", close_app)
 
 def toggle_pause():
     """Pause or resume capture and audio while excluding the pause interval."""
@@ -1301,11 +1817,18 @@ def toggle_pause():
     if not recording:
         return
     with pause_lock:
+
         if pause_event.is_set():
-            pause_event.clear()
+            resume_time = time.perf_counter()
+
             if pause_mark is not None:
-                pause_accum += time.perf_counter() - pause_mark
+                pause_intervals.append((pause_mark, resume_time))
+                pause_accum += resume_time - pause_mark
                 pause_mark = None
+
+            pause_event.clear()
+            capture_paused.clear()
+
             pause_btn.config(text="⏸",font=("Arial", 14), fg="#ff5555",
                bg=BUTTON_BG, activebackground="#505050", activeforeground=FG,
                relief="flat")
@@ -1369,22 +1892,37 @@ def on_quality_selected(value):
     output_width, output_height = QUALITY_MAP[value]
 
 tkinter.Label(input_frame, text="format: ", bg=BG, fg=FG).pack(side=tkinter.LEFT)
-make_dropdown(input_frame, format_var, list(FORMAT_MAP),
-              on_format_selected).pack(side=tkinter.LEFT, padx=(0, 20))
+
+format_dropdown = make_dropdown(
+    input_frame, format_var, list(FORMAT_MAP), on_format_selected
+)
+format_dropdown.pack(side=tkinter.LEFT, padx=(0, 20))
 
 tkinter.Label(input_frame, text="quality: ", bg=BG, fg=FG).pack(side=tkinter.LEFT)
-make_dropdown(input_frame, quality_var, list(QUALITY_MAP),
-              on_quality_selected).pack(side=tkinter.LEFT)
+
+quality_dropdown = make_dropdown(
+    input_frame, quality_var, list(QUALITY_MAP), on_quality_selected
+)
+quality_dropdown.pack(side=tkinter.LEFT)
 
 # --------------------------------------------------------------------------
 # Optional post-recording compression
 # --------------------------------------------------------------------------
 compress_var = tkinter.BooleanVar(master=window, value=False)
-tkinter.Checkbutton(
-    input_frame, text="Compress more (takes a while to compress!)",
-    variable=compress_var, bg=BG, fg=FG, selectcolor=BUTTON_BG,
-    activebackground=BG, activeforeground=FG, font=("Arial", 10),
-).pack(side=tkinter.LEFT, padx=(20, 0))
+
+compress_checkbutton = tkinter.Checkbutton(
+    input_frame,
+    text="Compress more (takes a while to compress!)",
+    variable=compress_var,
+    bg=BG,
+    fg=FG,
+    selectcolor=BUTTON_BG,
+    activebackground=BG,
+    activeforeground=FG,
+    font=("Arial", 10),
+)
+
+compress_checkbutton.pack(side=tkinter.LEFT, padx=(20, 0))
 
 # apply the defaults immediately so `format` and `quality_set` are initialized
 on_format_selected(format_var.get())
@@ -1424,8 +1962,11 @@ monitor_frame = tkinter.Frame(window, bg=BG)
 monitor_frame.pack(side=tkinter.TOP, pady=10, before=input_frame, anchor="w")
 
 tkinter.Label(monitor_frame, text="monitor: ", bg=BG, fg=FG).pack(side=tkinter.LEFT)
-make_dropdown(monitor_frame, monitor_var, MONITOR_LABELS,
-              on_monitor_selected, width=20).pack(side=tkinter.LEFT)
+monitor_dropdown = make_dropdown(
+    monitor_frame, monitor_var, MONITOR_LABELS,
+    on_monitor_selected, width=20
+)
+monitor_dropdown.pack(side=tkinter.LEFT)
 
 AUDIO_LABELS = [label for label, _ in audio_source_devices] or ["Microphone (default)"]
 audio_var = tkinter.StringVar(master=window, value=AUDIO_LABELS[0])
@@ -1439,11 +1980,8 @@ def on_audio_source_selected(value):
                 audio_mode = "mic"
                 selected_mic_idx = key
             elif key == "mic":
-                # reset to the first enumerated mic
-                first_mic = next((k for _, k in audio_source_devices
-                                  if isinstance(k, int)), selected_mic_idx)
                 audio_mode = "mic"
-                selected_mic_idx = first_mic
+                selected_mic_idx = default_mic_idx
             else:
                 audio_mode = key
             return
@@ -1451,8 +1989,26 @@ def on_audio_source_selected(value):
 on_audio_source_selected(audio_var.get())
 
 tkinter.Label(monitor_frame, text="  audio: ", bg=BG, fg=FG).pack(side=tkinter.LEFT)
-make_dropdown(monitor_frame, audio_var, AUDIO_LABELS,
-              on_audio_source_selected, width=24).pack(side=tkinter.LEFT)
+audio_dropdown = make_dropdown(
+    monitor_frame, audio_var, AUDIO_LABELS,
+    on_audio_source_selected, width=24
+)
+audio_dropdown.pack(side=tkinter.LEFT)
+
+def _set_recording_options_enabled(enabled):
+    """Prevent settings and filename changes during recording/finalization."""
+
+    state = "normal" if enabled else "disabled"
+
+    for widget in (
+        entry,
+        format_dropdown,
+        quality_dropdown,
+        compress_checkbutton,
+        monitor_dropdown,
+        audio_dropdown,
+    ):
+        widget.configure(state=state)
 
 # --------------------------------------------------------------------------
 # Embedded preview widget
