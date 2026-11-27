@@ -11,7 +11,8 @@ The application is split across several threads coordinated with
 
     main thread (Tk)  – runs the GUI and dispatches queued UI callbacks
     session thread    – owns one recording lifecycle (start → stop → save)
-    capture thread    – grabs screen frames with `mss` and timestamps them
+    capture thread    – captures screen frames with DXcam and timestamps them;
+                         MSS is used to enumerate monitors and read geometry
     encode thread     – converts timestamped frames into a constant 30 FPS
                          stream and pipes raw BGR data into FFmpeg
     audio thread      – records microphone audio with `sounddevice` and/or
@@ -125,6 +126,9 @@ pause_lock = threading.Lock()
 audio_started = threading.Event()
 capture_ready = threading.Event()
 system_ready = threading.Event()
+audio_failed = threading.Event()
+encoder_failed = threading.Event()
+capture_failed = threading.Event()
 session_thread  = None
 recording       = False
 recording_finishing = False     
@@ -247,11 +251,15 @@ def _switch_preview_monitor():
     _preview_switching.set()
 
     def _do_switch():
-        global preview_thread
+        global preview_thread, preview_frame
         try:
             preview_enabled.clear()
             if preview_thread is not None and preview_thread.is_alive():
                 preview_thread.join(timeout=2.0)
+
+                if preview_thread.is_alive():
+                    print("Preview switch cancelled: old preview thread did not stop.")
+                    return
             with preview_frame_lock:
                 preview_frame = None
             preview_enabled.set()
@@ -294,66 +302,95 @@ atexit.register(_cleanup_temps)
 # --------------------------------------------------------------------------
 # Timestamped screen-capture thread
 # --------------------------------------------------------------------------
-def capture():
-    """Capture frames and attach their real active-recording timestamps.
 
-    Timestamps exclude paused time. The encoder uses them to duplicate frames
-    onto the 30 FPS output timeline when capture temporarily runs below 30 FPS.
-    """
+def capture():
+    """Capture frames with DXcam and preserve active-recording timestamps."""
     global dropped_frames, captured_frames, capture_duration
 
-    frame_interval = 1 / fps
     need_resize = (output_width, output_height) != (capture_width, capture_height)
     active_elapsed = 0.0
     last_tick = time.perf_counter()
     last_frame_time = 0.0
+    camera = None
 
     try:
-        with mss.MSS() as screen:
-            next_frame_time = time.perf_counter()
-            while not stop_event.is_set():
-                now = time.perf_counter()
-                if pause_event.is_set():
-                    last_tick = now
-                    next_frame_time = now
-                    time.sleep(0.02)
-                    continue
+        # MSS monitor indices are 1-based; DXcam output indices are 0-based.
+        output_idx = max(0, selected_monitor_idx - 1)
 
-                active_elapsed += now - last_tick
+        # Reuse the existing cached DXcam camera.
+        camera = _get_preview_camera(output_idx)
+
+        if camera is None:
+            raise RuntimeError("Could not initialize DXcam.")
+
+        # DXcam handles frame pacing in its own capture thread.
+        camera.start(target_fps=int(round(fps)), video_mode=True)
+
+        while not stop_event.is_set():
+            now = time.perf_counter()
+
+            if pause_event.is_set():
                 last_tick = now
+                time.sleep(0.02)
+                continue
 
-                screenshot = screen.grab(monitor)
-                frame = cv2.cvtColor(np.asarray(screenshot), cv2.COLOR_BGRA2BGR)
-                if need_resize:
-                    frame = cv2.resize(frame, (output_width, output_height),
-                                       interpolation=cv2.INTER_LINEAR)
+            active_elapsed += now - last_tick
+            last_tick = now
 
-                # Include the time spent acquiring/converting this frame.
-                frame_time = active_elapsed + (time.perf_counter() - now)
-                try:
-                    Frames.put_nowait((frame, frame_time))
-                except queue.Full:
-                    dropped_frames += 1
-                else:
-                    captured_frames += 1
-                    last_frame_time = frame_time
-                    capture_ready.set()
+            # Wait for the next frame from DXcam.
+            frame = camera.get_latest_frame()
 
-                next_frame_time += frame_interval
-                sleep_time = next_frame_time - time.perf_counter()
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                elif sleep_time < -frame_interval:
-                    # fell behind -> reset schedule instead of burst-catchup
-                    next_frame_time = time.perf_counter()
+            if frame is None:
+                time.sleep(0.005)
+                continue
+
+            # Don't enqueue a frame if recording was paused while waiting.
+            if pause_event.is_set():
+                last_tick = time.perf_counter()
+                continue
+
+            if need_resize:
+                frame = cv2.resize(
+                    frame,
+                    (output_width, output_height),
+                    interpolation=cv2.INTER_LINEAR
+                )
+
+            # Keep the existing active-recording timestamp system.
+            frame_time = active_elapsed + (time.perf_counter() - now)
+
+            try:
+                Frames.put_nowait((frame, frame_time))
+            except queue.Full:
+                dropped_frames += 1
+            else:
+                captured_frames += 1
+                last_frame_time = frame_time
+                capture_ready.set()
+
+    except Exception as e:
+        print(RED + f"Capture failed: {e}" + RESET)
+        capture_failed.set()
+        stop_event.set()
+
     finally:
-        # Include the final active interval, but never count time spent paused.
+        if camera is not None:
+            try:
+                camera.stop()
+            except Exception as e:
+                print(f"DXcam stop warning: {e}")
+
+        # Preserve the original recording-duration calculation.
         if not pause_event.is_set():
-            capture_duration = max(last_frame_time,
-                                   active_elapsed + (time.perf_counter() - last_tick))
+            capture_duration = max(
+                last_frame_time,
+                active_elapsed + (time.perf_counter() - last_tick)
+            )
         else:
             capture_duration = last_frame_time
+
         capture_finished.set()
+
 
 
 # --------------------------------------------------------------------------
@@ -401,13 +438,11 @@ def encode(proc):
                 write_frame(current_frame)
                 next_output_time += output_interval
 
-    except (BrokenPipeError, OSError) as e:
+    except Exception as e:
         print(RED + "ffmpeg pipe broke; stopping" + RESET)
+        encoder_failed.set()
         stop_event.set()
-        ui_post(lambda err=e: messagebox.showerror(
-            "Recording failed",
-            f"Encoder stopped unexpectedly:\\n{err}\\n\\n"
-            f"The current recording was not saved."))
+
     finally:
         try:
             proc.stdin.close()
@@ -467,9 +502,12 @@ def enumerate_audio_devices():
 def _record_system_audio_thread():
     """Record system audio, synchronized with video capture."""
 
-    ctypes.windll.ole32.CoInitialize(None)
+    com_initialized = False
 
     try:
+        result = ctypes.windll.ole32.CoInitialize(None)
+        com_initialized = result in (0, 1)
+
         speaker = sc.default_speaker()
 
         loopback_mic = sc.get_microphone(
@@ -479,6 +517,7 @@ def _record_system_audio_thread():
 
         if not loopback_mic:
             print(RED + "Could not find loopback microphone." + RESET)
+            audio_failed.set()
             return
 
         with loopback_mic.recorder(
@@ -506,9 +545,11 @@ def _record_system_audio_thread():
 
     except Exception as e:
         print(RED + f"WASAPI Loopback failed: {e}" + RESET)
+        audio_failed.set()
 
     finally:
-        ctypes.windll.ole32.CoUninitialize()
+        if com_initialized:
+            ctypes.windll.ole32.CoUninitialize()
 
 def record_audio(path):
     """Record from the selected source (mic, system loopback, or both)."""
@@ -519,30 +560,47 @@ def record_audio(path):
 
     # 1. Setup Microphone (still uses sounddevice)
     if audio_mode in ("mic", "mic+system") and selected_mic_idx is not None:
-        streams.append(sounddevice.InputStream(
-            samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE,
-            device=selected_mic_idx,
-            callback=lambda *a: _audio_callback(*a, target=mic_frames),
-        ))
+        try:
+            streams.append(sounddevice.InputStream(
+                samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE,
+                device=selected_mic_idx,
+                callback=lambda *a: _audio_callback(*a, target=mic_frames),
+            ))
+        except Exception as e:
+            print(RED + f"Microphone setup failed: {e}" + RESET)
+            audio_failed.set()
 
     # 2. Setup System Audio (using soundcard)
     if audio_mode in ("system", "mic+system"):
-        system_thread = threading.Thread(target=_record_system_audio_thread, daemon=True)
-        system_thread.start()
+        try:
+            system_thread = threading.Thread(
+                target=_record_system_audio_thread, daemon=True
+            )
+            system_thread.start()
+        except Exception as e:
+            print(RED + f"System audio startup failed: {e}" + RESET)
+            audio_failed.set()
+            system_thread = None
 
     if not streams and system_thread is None:
         print(RED + "No usable audio device for the selected source." + RESET)
+        audio_failed.set()
         audio_started.set()
         return
 
     # 3. Start Recording
     for s in streams:
-        s.start()
+        try:
+            s.start()
+        except Exception as e:
+            print(RED + f"Microphone startup failed: {e}" + RESET)
+            audio_failed.set()
 
     # Wait until WASAPI is actually initialized.
     if system_thread is not None:
         if not system_ready.wait(timeout=5.0):
             print(RED + "WASAPI initialization timed out." + RESET)
+            audio_failed.set()
 
     # All audio sources are now ready.
     audio_started.set() # Signal that audio is running
@@ -568,9 +626,25 @@ def record_audio(path):
         mic  = np.concatenate(mic_frames,  axis=0) if mic_frames  else np.zeros((0, CHANNELS), np.int16)
         loop = np.concatenate(loop_frames, axis=0) if loop_frames else np.zeros((0, CHANNELS), np.int16)
 
+    # Check whether every selected source actually produced audio.
+    if audio_mode in ("mic", "mic+system") and len(mic) == 0:
+        print(RED + "No microphone audio was captured." + RESET)
+        audio_failed.set()
+
+    if audio_mode in ("system", "mic+system") and len(loop) == 0:
+        print(RED + "No system audio was captured." + RESET)
+        audio_failed.set()
+
     if len(mic) and len(loop):
-        n = min(len(mic), len(loop))
-        mixed = mic[:n].astype(np.int32) + (loop[:n] * 0.7).astype(np.int32)
+        n = max(len(mic), len(loop))
+
+        mic_padded = np.zeros((n, CHANNELS), dtype=np.int16)
+        loop_padded = np.zeros((n, CHANNELS), dtype=np.int16)
+
+        mic_padded[:len(mic)] = mic
+        loop_padded[:len(loop)] = loop
+
+        mixed = mic_padded.astype(np.int32) + (loop_padded * 0.7).astype(np.int32)
         audio = np.clip(mixed, -32768, 32767).astype(np.int16)
     elif len(mic):
         audio = mic
@@ -581,11 +655,21 @@ def record_audio(path):
 
     if len(audio) == 0:
         print(RED + "No audio captured — skipping WAV write." + RESET)
+        audio_failed.set()
         return
 
     wavio.write(path, audio, SAMPLE_RATE, sampwidth=2)
     print(RED + f"Saved {len(audio) / SAMPLE_RATE:.2f}s audio" + RESET)
 
+def audio_worker(path):
+    """Run audio recording and report unexpected worker failures."""
+    try:
+        record_audio(path)
+    except Exception as e:
+        audio_failed.set()
+        audio_started.set()
+        print(RED + f"Audio recording failed unexpectedly: {e}" + RESET)
+        
 # --------------------------------------------------------------------------
 # FFmpeg helpers
 # --------------------------------------------------------------------------
@@ -712,6 +796,40 @@ def build_compress_cmd(ffmpeg_path, in_video, in_audio, out_path, has_audio):
 # --------------------------------------------------------------------------
 # Session (one complete recording lifecycle)
 # --------------------------------------------------------------------------
+
+def ask_keep_temp_files(tmpdir, error):
+    """Ask the user whether to keep or delete temporary recording files."""
+    result = {"keep": False}
+    answer_received = threading.Event()
+
+    def ask():
+        try:
+            result["keep"] = messagebox.askyesno(
+                "Recording failed",
+                f"{error}\n\n"
+                "Do you want to keep the temporary recording files?\n\n"
+                f"{tmpdir}",
+                parent=window
+            )
+        except tkinter.TclError:
+            # If the window is no longer available, delete the files.
+            result["keep"] = False
+        finally:
+            answer_received.set()
+
+    ui_post(ask)
+    answer_received.wait()
+
+    if result["keep"]:
+        if tmpdir in _tempdirs:
+            _tempdirs.remove(tmpdir)
+        print(RED + f"Temporary recording files kept at: {tmpdir}" + RESET)
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        if tmpdir in _tempdirs:
+            _tempdirs.remove(tmpdir)
+        print(RED + "Temporary recording files deleted." + RESET)
+
 def session():
     """Run one complete recording lifecycle on the session worker thread.
 
@@ -749,24 +867,48 @@ def session():
         encoded_frames = 0
         capture_duration = 0.0
         capture_finished.clear()
+        audio_failed.clear()
 
         try:
             ffmpeg_path = find_ffmpeg()
         except FileNotFoundError as e:
             print(RED + str(e) + RESET)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+            if tmpdir in _tempdirs:
+                _tempdirs.remove(tmpdir)
+
+            ui_post(lambda err=e: messagebox.showerror("FFmpeg missing", str(err)))
             return
 
         cmd = build_record_cmd(ffmpeg_path, video_temp)
-        # bufsize=0 -> unbuffered stdin, so capture back-pressure is real
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=0, creationflags=subprocess.CREATE_NO_WINDOW)
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                bufsize=0,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+        except OSError as e:
+            print(RED + f"Could not start FFmpeg: {e}" + RESET)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+            if tmpdir in _tempdirs:
+                _tempdirs.remove(tmpdir)
+
+            ui_post(lambda err=e: messagebox.showerror(
+                "FFmpeg failed to start", str(err)
+            ))
+            return
 
         capture_thread = threading.Thread(target=capture)
         encode_thread  = threading.Thread(target=encode, args=(proc,))
-        audio_thread   = threading.Thread(target=record_audio, args=(audio_temp,))
+        audio_thread   = threading.Thread(target=audio_worker, args=(audio_temp,))
 
         audio_thread.start()
 
-        if not audio_started.wait(timeout=3.0):
+        if not audio_started.wait(timeout=6.0):
             print("no audio device! video only!")
 
         start_time = time.perf_counter()
@@ -782,8 +924,21 @@ def session():
 
         rc = proc.wait()
         elapsed = time.perf_counter() - start_time
-        if rc != 0:
-            print(RED + f"ffmpeg exited with code {rc}" + RESET)
+
+        if rc != 0 or encoder_failed.is_set() or capture_failed.is_set():
+            if capture_failed.is_set():
+                error = "Screen capture failed unexpectedly."
+            elif encoder_failed.is_set():
+                error = f"Video encoder failed. FFmpeg exited with code {rc}."
+            else:
+                error = f"FFmpeg exited with code {rc}"
+
+            print(RED + error + RESET)
+
+            ui_post(lambda: set_status("Save failed", "#ff7777"))
+            ask_keep_temp_files(tmpdir, error)
+            return
+        
         with pause_lock:
             paused_total = pause_accum
             if pause_mark is not None:            # stopped while still paused
@@ -797,6 +952,8 @@ def session():
         if not save_requested:
             ui_post(lambda: set_status("Discarded", "#aaaaaa"))
             shutil.rmtree(tmpdir, ignore_errors=True)
+            if tmpdir in _tempdirs:
+                _tempdirs.remove(tmpdir)
             return
 
         ui_post(lambda: set_status("Saving...", "#e5b567"))
@@ -810,6 +967,8 @@ def session():
             audio_sec = 0.0
         print(f"audio: {audio_sec:.2f}s  video: {encoded_frames/fps_output:.2f}s")
         
+        save_succeeded = False
+
         try:
             compress_cmd = (build_compress_cmd(ffmpeg_path, video_temp, audio_temp,
                                                out_path, have_audio)
@@ -824,6 +983,7 @@ def session():
                 ui_post(lambda: (window.title("Screen Recorder — Compressing..."),
                                  set_status("Compressing...", "#5dade2")))
                 subprocess.run(compress_cmd, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                save_succeeded = True
                 ui_post(lambda: (window.title("Screen Recorder"),
                                  set_status("Saved", "#70c78a")))
                 try:
@@ -859,9 +1019,12 @@ def session():
                     out_path,
                 ]
                 subprocess.run(merge_cmd, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                save_succeeded = True
+
                 ui_post(lambda: set_status("Saved", "#70c78a"))
             else:
                 shutil.copy(video_temp, out_path)
+                save_succeeded = True
                 ui_post(lambda: set_status("Saved", "#70c78a"))
         except Exception as e:
             ui_post(lambda: (window.title("Screen Recorder"),
@@ -870,7 +1033,20 @@ def session():
             ui_post(lambda err=e: messagebox.showerror(
                 "Save failed", f"Could not write {out_path}:\n{err}"))
 
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        if save_succeeded:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            if tmpdir in _tempdirs:
+                _tempdirs.remove(tmpdir)
+
+            if audio_failed.is_set():
+                ui_post(lambda: messagebox.showwarning(
+                    "Audio recording issue",
+                    "One or more selected audio sources failed or produced no audio.\n\n"
+                    "Your video was saved with any audio that was successfully captured.",
+                    parent=window
+                ))
+        else:
+            ask_keep_temp_files(tmpdir, "The recording could not be saved.")
 
     finally:
         recording = False
@@ -940,7 +1116,7 @@ def _thread_crash(args):
     except Exception:
         pass
     try:
-        window.after(0, lambda: messagebox.showerror(
+        ui_post(lambda: messagebox.showerror(
             "Background thread crashed",
             f"{args.thread.name} crashed:\n{args.exc_value}"))
     except Exception:
@@ -968,7 +1144,7 @@ def make_tool_button(parent, text, fg, command, **kw):
         command=command, **kw)
 
 row = tkinter.Frame(window, bg=BG)
-row.pack(side=tkinter.TOP, pady=20)
+row.pack(side=tkinter.TOP, pady=20, anchor="w")
 
 tkinter.Label(row, text="filename: ", bg=BG, fg=FG).pack(side=tkinter.LEFT)
 entry = tkinter.Entry(row, width=40, bg=ENTRY_BG, fg=FG,
@@ -1006,17 +1182,28 @@ def start_record():
     audio_started.clear()
     capture_ready.clear()
     system_ready.clear()
+    encoder_failed.clear()
+    capture_failed.clear()
     pause_accum = 0.0
     pause_mark = None
-    pause_btn.config(state="normal", text="⏸",font=("Arial", 14), fg="#ff5555",
-               bg=BUTTON_BG, activebackground="#505050", activeforeground=FG,
-               relief="flat")
 
     preview_was_on = preview_enabled.is_set()
     if preview_was_on:
         toggle_preview()
 
+        if preview_thread is not None and preview_thread.is_alive():
+            messagebox.showerror(
+                "Preview still running",
+                "The preview could not stop properly. Please try again."
+            )
+            return
+
+    pause_btn.config(state="normal", text="⏸",font=("Arial", 14), fg="#ff5555",
+                   bg=BUTTON_BG, activebackground="#505050", activeforeground=FG,
+                   relief="flat")
+
     compress_final = compress_var.get()
+
     recording = True
     set_status("Recording", "#ff5555")
     session_thread = threading.Thread(target=session, daemon=True)
@@ -1096,9 +1283,17 @@ def close_app():
         preview_thread.join(timeout=2.0)
 
     if session_thread and session_thread.is_alive():
-        session_thread.join(timeout=5.0)
+        window.after(100, _wait_for_session_and_close)
+        return
 
     window.destroy()
+
+
+def _wait_for_session_and_close():
+    if session_thread and session_thread.is_alive():
+        window.after(100, _wait_for_session_and_close)
+    else:
+        window.destroy()
 
 def toggle_pause():
     """Pause or resume capture and audio while excluding the pause interval."""
@@ -1146,7 +1341,7 @@ status_label.pack(side="left", padx=(10, 0))
 
 
 input_frame = tkinter.Frame(window, bg=BG)
-input_frame.pack(side=tkinter.TOP, pady=20)
+input_frame.pack(side=tkinter.TOP, pady=20, anchor="w")
 
 FORMAT_MAP = {
     "MP4":  ".mp4",
@@ -1252,6 +1447,8 @@ def on_audio_source_selected(value):
             else:
                 audio_mode = key
             return
+
+on_audio_source_selected(audio_var.get())
 
 tkinter.Label(monitor_frame, text="  audio: ", bg=BG, fg=FG).pack(side=tkinter.LEFT)
 make_dropdown(monitor_frame, audio_var, AUDIO_LABELS,
